@@ -1,22 +1,25 @@
 import asyncio
 import io
-import os
 import logging
+import os
+import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TypedDict
 from uuid import UUID
+import tensorflow as tf
+
+import aiohttp
+import asyncpg
+import cv2
 import face_recognition
 import numpy as np
-import cv2
-import aiohttp
+import timm
+import torch
+import torch.nn as nn
 from aiohttp import web
-import asyncpg
-import tensorflow as tf
 from dotenv import load_dotenv
 from PIL import Image
-import uuid
-from pathlib import Path
-
 
 # ─── Logging Setup ────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -30,10 +33,22 @@ logger = logging.getLogger("ai-worker")
 load_dotenv()
 DB_URL = os.getenv("DATABASE_URL")
 API_HOST = os.getenv("API_HOST", "http://localhost:8080")
-MODEL_PATH = os.getenv("MODEL_PATH", "./model.h5")
 AI_ID = os.getenv("AI_ID")
 AI_PASSWORD = os.getenv("AI_PASSWORD")
 DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() == "true"
+
+device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+MODEL_PATH = os.getenv("MODEL_PATH", "./model.h5")
+WEIGHTS_DIR = os.getenv("MODEL_PATH", "./weights")
+WEIGHT_FILES = sorted(
+    [
+        os.path.join(WEIGHTS_DIR, fname)
+        for fname in os.listdir(WEIGHTS_DIR)
+        if fname.startswith("final_") and "DeepFakeClassifier" in fname
+    ]
+)
+torch.serialization.add_safe_globals([np.core.multiarray.scalar])
+class_names = ["fake", "real"]
 
 if DEBUG_MODE:
     DEBUG_DIR = Path("debug")
@@ -53,10 +68,56 @@ class PredictionResult(TypedDict):
     post_url: str
 
 
+# ─── Create Model ────────────────────────────────────────────────────────────────
+class DeepFakeClassifier(nn.Module):
+    def __init__(self, encoder, num_classes=1, dropout_rate=0.5):
+        super().__init__()
+        self.encoder = encoder
+        self.dropout = nn.Dropout(p=dropout_rate)
+        self.fc = nn.Linear(2560, num_classes)
+
+    def forward(self, x):
+        x = self.encoder(x)
+        x = self.dropout(x)
+        x = self.fc(x)
+        return x
+
+
+def create_model():
+    encoder = timm.create_model(
+        "tf_efficientnet_b7_ns", pretrained=False, num_classes=0, global_pool="avg"
+    )
+    # encoder.classifier = nn.Identity()
+    model = DeepFakeClassifier(encoder, num_classes=1, dropout_rate=0.5)
+    return model
+
+
 # ─── Load Model ────────────────────────────────────────────────────────────────
-logger.info("Loading model from %s …", MODEL_PATH)
-model = tf.keras.models.load_model(MODEL_PATH)
-logger.info("Model loaded successfully.")
+# logger.info("Loading model from %s …", MODEL_PATH)
+# model = tf.keras.models.load_model(MODEL_PATH)
+# logger.info("Model loaded successfully.")
+models = []
+tf_model = tf.keras.models.load_model("filter_classifier_model.keras")
+for weight_path in WEIGHT_FILES:
+    print(f"Loading weights from: {weight_path}")
+    model = create_model().to(device)
+    state_dict = torch.load(weight_path, map_location=device, weights_only=False)
+    if "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
+
+    state_dict = {
+        k.replace("model.", "").replace("module.", ""): v for k, v in state_dict.items()
+    }
+
+    for key in list(state_dict.keys()):
+        if key.startswith("encoder.classifier."):
+            print(f"Removing unexpected key: {key}")
+            del state_dict[key]
+
+    model.load_state_dict(state_dict)
+    model.eval()
+    models.append(model)
+print(f"{len(models)} models loaded on {device}.")
 
 
 # ─── Retry Helper ──────────────────────────────────────────────────────────────
@@ -73,18 +134,85 @@ async def retry_async(fn, retries=3, delay=1, backoff=2):
 
 
 # ─── Inference ─────────────────────────────────────────────────────────────────
+from torchvision import transforms  # noqa: E402
+
+transform = transforms.Compose(
+    [
+        transforms.Resize((380, 389)),
+        transforms.ToTensor(),  # converts to [0, 1] and permutes to [C, H, W]
+        transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],  # standard ImageNet means
+            std=[0.229, 0.224, 0.225],
+        ),
+    ]
+)
+
+
+def preprocess_image(image_bytes: bytes) -> torch.Tensor:
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    img_tensor = transform(img).unsqueeze(0).to(device)
+    return img_tensor
+
+
+def combine_predictions(
+    ensemble_prob: float, tf_prob: float, weight_ensemble=0.5
+) -> tuple[str, float]:
+    """
+    Combines ensemble and TensorFlow predictions.
+
+    Args:
+        ensemble_probs: List of fake probabilities from PyTorch models.
+        tf_prob: Fake probability from TensorFlow model.
+        weight_ensemble: Weight for ensemble models in [0.0, 1.0]
+
+    Returns:
+        label: "real" or "fake"
+        confidence: max probability * 100
+    """
+    # Weighted average between ensemble and tf model
+    combined_fake_prob = (ensemble_prob * weight_ensemble) + (
+        tf_prob * (1 - weight_ensemble)
+    )
+    real_prob = 1 - combined_fake_prob
+
+    label = "fake" if combined_fake_prob > real_prob else "real"
+    confidence = max(combined_fake_prob, real_prob)
+
+    return label, confidence
+
+
 async def run_inference(image_bytes: bytes) -> tuple[str, float] | None:
     try:
-        logger.debug("Running inference …")
-        img = Image.open(io.BytesIO(image_bytes)).convert("RGB").resize((128, 128))
-        tensor = tf.convert_to_tensor(
-            [tf.keras.preprocessing.image.img_to_array(img) / 255.0]
-        )
-        preds = model.predict(tensor, verbose=0)[0]
-        confidence = float(preds.max())
-        label = str(preds.argmax())
-        logger.debug("Inference result: label=%s confidence=%.4f", label, confidence)
-        return label, confidence
+        logger.debug("Running inference on ensemble…")
+        # input_tensor = preprocess_image(image_bytes)
+
+        # all_probs = []
+        # for model in models:
+        #     with torch.no_grad():
+        #         output = model(input_tensor)
+        #         prob = torch.sigmoid(output).item()  # scalar in [0,1]
+        #         all_probs.append(prob)
+
+        # avg_fake_prob = sum(all_probs) / len(all_probs)
+        # real_prob = 1 - avg_fake_prob
+
+        # # label = "fake" if avg_fake_prob > real_prob else "real"
+        # confidence = max(avg_fake_prob, real_prob)
+
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        img = img.resize((128, 128))
+        img_array = tf.keras.utils.img_to_array(img)
+        img_array = tf.expand_dims(img_array, 0)  # Create a batch
+
+        score = tf_model.predict(img_array)[0][0]
+        fake_index = class_names.index("fake")
+
+        # return combine_predictions(confidence, score)
+        if (score < 0.5 and fake_index == 0) or (score >= 0.5 and fake_index == 1):
+            return "real", (100 * (1 - score))
+        else:
+            return "fake", (100 * score)
+
     except Exception as e:
         logger.exception("Inference failed: %s", e)
         return None
@@ -224,7 +352,7 @@ async def process_job(
 
                 distances = face_recognition.face_distance(encodings, user_encoding)
                 best_distance = distances.min()
-                threshold = 0.6  # lower = stricter match
+                threshold = 0.5  # lower = stricter match
                 face_match = best_distance <= threshold
 
                 if DEBUG_MODE:
@@ -272,12 +400,12 @@ async def process_job(
 
             label, confidence = inference
             payload: PredictionResult = {
-                "confidence": confidence,
+                "confidence": float(confidence),
                 "job_id": str(job_id),
                 "user_id": str(user_id),
                 "media_url": media_url,
                 "detected_at": str(datetime.now(timezone.utc)),
-                "label": "real" if (label == 1) else "fake",
+                "label": label,
                 "serial_id": serial_id,
                 "post_url": post_url,
             }
